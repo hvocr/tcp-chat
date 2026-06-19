@@ -11,8 +11,12 @@ def receive_messages(client_socket):
             message = client_socket.recv(1024).decode('utf-8')
             if not message:
                 break
-            # \r clears the line so "You: " prompt doesn't get messy
-            print(f"\r{message}\nYou: ", end="")
+            
+            # FIX: Print the message with a newline, then print the prompt separately.
+            # This prevents the "double prompt" bug where \r doesn't clear the line properly.
+            print(f"\r{message}\n")
+            print("You: ", end="")
+            
         except:
             print("\n[Client] Disconnected from server.")
             break
@@ -30,11 +34,12 @@ def start_client():
         print("[Client] Could not connect to server. Make sure it's running.")
         return
     
-    # STEP 1: Send the nickname as the VERY FIRST message
+    # Send the nickname as the VERY FIRST message
     client_socket.send(nickname.encode('utf-8'))
     
     print(f"[Client] Connected as '{nickname}'!")
-    print("Type '/quit' to exit.\n")
+    print("Commands: /users, /msg <nickname> <message>, /quit")
+    print("Type your messages below.\n")
     
     # Start the background listener thread
     receive_thread = threading.Thread(target=receive_messages, args=(client_socket,))
