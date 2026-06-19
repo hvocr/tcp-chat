@@ -4,11 +4,12 @@ import threading
 HOST = '0.0.0.0'
 PORT = 65432
 
-clients = []
+# Dictionary: {client_socket: nickname}
+nicknames = {}
 
 def broadcast(message, sender_socket=None):
     """Send a message to every connected client except the sender."""
-    for client in clients:
+    for client in list(nicknames.keys()):
         if client != sender_socket:
             try:
                 client.send(message.encode('utf-8'))
@@ -16,28 +17,45 @@ def broadcast(message, sender_socket=None):
                 remove_client(client)
 
 def remove_client(client_socket):
-    """Remove a client socket from the global list and close it."""
-    if client_socket in clients:
-        clients.remove(client_socket)
+    """Clean up a disconnected client."""
+    if client_socket in nicknames:
+        nickname = nicknames[client_socket]
+        del nicknames[client_socket]
         client_socket.close()
+        print(f"[Server] {nickname} removed from active clients.")
+        broadcast(f"[Server] {nickname} has left the chat.")
 
 def handle_client(client_socket, addr):
     """Runs in a separate thread for each client."""
-    print(f"[Server] {addr} connected.")
-    broadcast(f"[Server] A new user has joined the chat!", client_socket)
+    print(f"[Server] {addr} connected. Waiting for nickname...")
     
+    # STEP 1: Receive the nickname (first message is treated as nickname)
+    try:
+        nickname = client_socket.recv(1024).decode('utf-8').strip()
+        if not nickname:
+            remove_client(client_socket)
+            return
+    except:
+        remove_client(client_socket)
+        return
+    
+    # STEP 2: Store the nickname
+    nicknames[client_socket] = nickname
+    print(f"[Server] {nickname} ({addr}) has joined the chat!")
+    broadcast(f"[Server] {nickname} has joined the chat!", client_socket)
+    
+    # STEP 3: Listen for messages from this client
     while True:
         try:
-            message = client_socket.recv(1024).decode('utf-8')
+            message = client_socket.recv(1024).decode('utf-8').strip()
             if not message:
                 break
-            print(f"[Server] {addr} says: {message}")
-            broadcast(f"{addr}: {message}", client_socket)
+            print(f"[Server] {nickname} says: {message}")
+            broadcast(f"{nickname}: {message}", client_socket)
         except:
             break
     
-    print(f"[Server] {addr} disconnected.")
-    broadcast(f"[Server] A user has left the chat.", client_socket)
+    # STEP 4: Clean up
     remove_client(client_socket)
 
 def start_server():
@@ -49,7 +67,6 @@ def start_server():
     
     while True:
         client_socket, addr = server_socket.accept()
-        clients.append(client_socket)
         thread = threading.Thread(target=handle_client, args=(client_socket, addr))
         thread.daemon = True
         thread.start()

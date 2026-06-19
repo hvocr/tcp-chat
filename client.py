@@ -18,6 +18,11 @@ def receive_messages(client_socket):
             break
 
 def start_client():
+    # Ask for nickname BEFORE connecting
+    nickname = input("Enter your nickname: ").strip()
+    if not nickname:
+        nickname = "Anonymous"
+    
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         client_socket.connect((HOST, PORT))
@@ -25,7 +30,10 @@ def start_client():
         print("[Client] Could not connect to server. Make sure it's running.")
         return
     
-    print("[Client] Connected to chat server! Type your messages below.")
+    # STEP 1: Send the nickname as the VERY FIRST message
+    client_socket.send(nickname.encode('utf-8'))
+    
+    print(f"[Client] Connected as '{nickname}'!")
     print("Type '/quit' to exit.\n")
     
     # Start the background listener thread
@@ -38,11 +46,12 @@ def start_client():
         message = input("You: ")
         if message.lower() == '/quit':
             break
-        try:
-            client_socket.send(message.encode('utf-8'))
-        except:
-            print("[Client] Connection lost.")
-            break
+        if message.strip():
+            try:
+                client_socket.send(message.encode('utf-8'))
+            except:
+                print("[Client] Connection lost.")
+                break
     
     client_socket.close()
 
