@@ -1,35 +1,40 @@
 import socket
 import threading
+import time
 
 HOST = '0.0.0.0'
 PORT = 65432
 
-# Dictionary: {client_socket: nickname}
 nicknames = {}
+
+def recv_exact(client_socket, size):
+    """Receive exactly `size` bytes from the socket. Returns None if connection fails."""
+    data = b''
+    while len(data) < size:
+        try:
+            chunk = client_socket.recv(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        except:
+            return None
+    return data
+
+def send_message(client_socket, message):
+    """Send a length-prefixed message."""
+    try:
+        msg_bytes = message.encode('utf-8')
+        header = len(msg_bytes).to_bytes(4, 'big')
+        client_socket.sendall(header + msg_bytes)
+        return True
+    except:
+        return False
 
 def broadcast(message, sender_socket=None):
     """Send a message to every connected client except the sender."""
     for client in list(nicknames.keys()):
         if client != sender_socket:
-            try:
-                client.send(message.encode('utf-8'))
-            except:
-                remove_client(client)
-
-def send_private(target_nickname, message, sender_socket):
-    """Send a private message to a specific user by nickname."""
-    # Find the socket that matches the target nickname
-    for client_socket, nickname in nicknames.items():
-        if nickname.lower() == target_nickname.lower():
-            try:
-                sender_nick = nicknames[sender_socket]
-                client_socket.send(f"[Private from {sender_nick}]: {message}".encode('utf-8'))
-                # Also send a confirmation to the sender so they know it was delivered
-                sender_socket.send(f"[Private to {target_nickname}]: {message}".encode('utf-8'))
-                return True
-            except:
-                return False
-    return False  # Target not found
+            send_message(client, message)
 
 def remove_client(client_socket):
     """Clean up a disconnected client."""
@@ -37,79 +42,89 @@ def remove_client(client_socket):
         nickname = nicknames[client_socket]
         del nicknames[client_socket]
         client_socket.close()
-        print(f"[Server] {nickname} removed from active clients.")
+        print(f"[Server] {nickname} removed.")
         broadcast(f"[Server] {nickname} has left the chat.")
-
-def get_active_users():
-    """Return a comma-separated list of all nicknames."""
-    return ", ".join(nicknames.values())
 
 def handle_client(client_socket, addr):
     """Runs in a separate thread for each client."""
     print(f"[Server] {addr} connected. Waiting for nickname...")
     
-    # STEP 1: Receive the nickname
-    try:
-        nickname = client_socket.recv(1024).decode('utf-8').strip()
-        if not nickname:
-            remove_client(client_socket)
-            return
-    except:
-        remove_client(client_socket)
+    # 1. Receive nickname (first message)
+    nickname_bytes = recv_exact(client_socket, 4)
+    if not nickname_bytes:
+        client_socket.close()
         return
     
-    # Reserve "Server" as a system name (optional)
-    if nickname.lower() == "server":
-        client_socket.send("You cannot use 'Server' as a nickname.".encode('utf-8'))
-        remove_client(client_socket)
+    nickname_len = int.from_bytes(nickname_bytes, 'big')
+    nickname_data = recv_exact(client_socket, nickname_len)
+    if not nickname_data:
+        client_socket.close()
         return
     
+    nickname = nickname_data.decode('utf-8').strip()
+    if not nickname:
+        client_socket.close()
+        return
+    
+    # 2. Store the nickname
     nicknames[client_socket] = nickname
-    print(f"[Server] {nickname} ({addr}) has joined the chat!")
+    print(f"[Server] {nickname} ({addr}) joined!")
     broadcast(f"[Server] {nickname} has joined the chat!", client_socket)
     
-    # STEP 2: Listen for messages
+    # 3. Main message loop (now with length-prefixing!)
     while True:
-        try:
-            raw_message = client_socket.recv(1024).decode('utf-8').strip()
-            if not raw_message:
-                break
-            
-            # --- COMMAND PARSING ---
-            if raw_message.startswith('/'):
-                parts = raw_message.split(' ', 2)  # Max split into 3 parts
-                command = parts[0].lower()
-                
-                if command == '/users':
-                    user_list = get_active_users()
-                    client_socket.send(f"[Server] Active users: {user_list}".encode('utf-8'))
-                    continue
-                
-                elif command == '/msg' and len(parts) >= 3:
-                    target = parts[1]
-                    private_msg = parts[2]
-                    success = send_private(target, private_msg, client_socket)
-                    if not success:
-                        client_socket.send(f"[Server] User '{target}' not found.".encode('utf-8'))
-                    continue
-                
-                else:
-                    client_socket.send(f"[Server] Unknown command: {command}. Available: /users, /msg <user> <message>".encode('utf-8'))
-                    continue
-            
-            # --- NORMAL BROADCAST ---
-            print(f"[Server] {nickname} says: {raw_message}")
-            broadcast(f"{nickname}: {raw_message}", client_socket)
-            
-        except:
+        # Read the 4-byte header
+        header = recv_exact(client_socket, 4)
+        if header is None:
             break
+        
+        msg_len = int.from_bytes(header, 'big')
+        msg_bytes = recv_exact(client_socket, msg_len)
+        if msg_bytes is None:
+            break
+        
+        raw_message = msg_bytes.decode('utf-8').strip()
+        if not raw_message:
+            continue
+        
+        # --- COMMAND PARSING ---
+        if raw_message.startswith('/'):
+            parts = raw_message.split(' ', 2)
+            command = parts[0].lower()
+            
+            if command == '/users':
+                user_list = ", ".join(nicknames.values())
+                send_message(client_socket, f"[Server] Active users: {user_list}")
+                continue
+            
+            elif command == '/msg' and len(parts) >= 3:
+                target = parts[1]
+                private_msg = parts[2]
+                found = False
+                for sock, name in nicknames.items():
+                    if name.lower() == target.lower():
+                        send_message(sock, f"[Private from {nickname}]: {private_msg}")
+                        send_message(client_socket, f"[Private to {target}]: {private_msg}")
+                        found = True
+                        break
+                if not found:
+                    send_message(client_socket, f"[Server] User '{target}' not found.")
+                continue
+            else:
+                send_message(client_socket, f"[Server] Unknown command. Available: /users, /msg <user> <message>")
+                continue
+        
+        # --- NORMAL BROADCAST ---
+        print(f"[Server] {nickname} says: {raw_message}")
+        broadcast(f"{nickname}: {raw_message}", client_socket)
     
-    # STEP 3: Clean up
+    # 4. Clean up
     remove_client(client_socket)
 
 def start_server():
     print(f"[Server] Starting on port {PORT}...")
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, PORT))
     server_socket.listen()
     print("[Server] Waiting for clients...")
