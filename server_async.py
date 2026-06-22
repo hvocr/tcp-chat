@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import ssl
 
 HOST = '0.0.0.0'
 PORT = 65432
@@ -7,7 +8,6 @@ PORT = 65432
 # Data structures
 clients = {}          # {writer: {'nickname': name, 'room': room_name}}
 rooms = {}            # {room_name: set(writers)}
-
 DEFAULT_ROOM = "general"
 
 def get_room(room_name):
@@ -17,16 +17,14 @@ def get_room(room_name):
     return rooms[room_name]
 
 def remove_client_from_room(writer):
-    """Remove a writer from their current room."""
     if writer in clients:
         room_name = clients[writer]['room']
         if room_name in rooms:
             rooms[room_name].discard(writer)
             if not rooms[room_name]:
-                del rooms[room_name]  # Clean up empty rooms
+                del rooms[room_name]
 
 def send_message(writer, message):
-    """Send a length-prefixed message to a specific client."""
     try:
         msg_bytes = message.encode('utf-8')
         header = len(msg_bytes).to_bytes(4, 'big')
@@ -36,7 +34,6 @@ def send_message(writer, message):
         return False
 
 async def broadcast_to_room(message, room_name, sender_writer=None):
-    """Send a message to everyone in a specific room."""
     if room_name not in rooms:
         return
     for writer in list(rooms[room_name]):
@@ -44,21 +41,7 @@ async def broadcast_to_room(message, room_name, sender_writer=None):
             send_message(writer, message)
             await writer.drain()
 
-async def broadcast(message, sender_writer=None):
-    """Legacy broadcast to all clients (kept for compatibility, but we use room broadcasts now)."""
-    # We'll just broadcast to the sender's room for simplicity.
-    if sender_writer in clients:
-        room = clients[sender_writer]['room']
-        await broadcast_to_room(message, room, sender_writer)
-    else:
-        # Fallback: send to all clients
-        for writer in list(clients.keys()):
-            if writer != sender_writer:
-                send_message(writer, message)
-                await writer.drain()
-
 def remove_client(writer):
-    """Clean up a disconnected client."""
     if writer in clients:
         nickname = clients[writer]['nickname']
         room_name = clients[writer]['room']
@@ -66,11 +49,9 @@ def remove_client(writer):
         remove_client_from_room(writer)
         del clients[writer]
         writer.close()
-        # Notify the room they left
         asyncio.create_task(broadcast_to_room(f"[Server] {nickname} has left the chat.", room_name))
 
 async def handle_client(reader, writer):
-    """Handles a single client connection asynchronously."""
     addr = writer.get_extra_info('peername')
     print(f"[Server] {addr} connected. Waiting for nickname...")
 
@@ -113,7 +94,6 @@ async def handle_client(reader, writer):
                 current_room = clients[writer]['room']
                 current_nick = clients[writer]['nickname']
 
-                # --- /join <room> ---
                 if command == '/join' and len(parts) >= 2:
                     target_room = parts[1].strip()
                     if target_room == current_room:
@@ -121,13 +101,10 @@ async def handle_client(reader, writer):
                         await writer.drain()
                         continue
                     
-                    # Leave current room
                     remove_client_from_room(writer)
-                    # Join new room
                     clients[writer]['room'] = target_room
                     rooms.setdefault(target_room, set()).add(writer)
                     
-                    # Notify both rooms
                     await broadcast_to_room(f"[Server] {current_nick} has left the chat.", current_room, writer)
                     await broadcast_to_room(f"[Server] {current_nick} has joined the chat.", target_room, writer)
                     
@@ -135,7 +112,6 @@ async def handle_client(reader, writer):
                     await writer.drain()
                     continue
 
-                # --- /users ---
                 elif command == '/users':
                     if current_room in rooms:
                         user_list = ", ".join([clients[w]['nickname'] for w in rooms[current_room]])
@@ -145,7 +121,6 @@ async def handle_client(reader, writer):
                     await writer.drain()
                     continue
 
-                # --- /rooms ---
                 elif command == '/rooms':
                     room_list = []
                     for room_name, writers in rooms.items():
@@ -155,13 +130,10 @@ async def handle_client(reader, writer):
                     await writer.drain()
                     continue
 
-                # --- /msg ---
                 elif command == '/msg' and len(parts) >= 3:
                     target = parts[1]
                     private_msg = parts[2]
                     found = False
-                    # Find target in the current room (or globally? Usually globally).
-                    # We'll search globally for simplicity, but we can restrict to room.
                     for w, data in clients.items():
                         if data['nickname'].lower() == target.lower():
                             send_message(w, f"[Private from {current_nick}]: {private_msg}")
@@ -192,10 +164,22 @@ async def handle_client(reader, writer):
         remove_client(writer)
 
 async def main():
-    print(f"[Async Server] Starting on port {PORT}...")
-    server = await asyncio.start_server(handle_client, HOST, PORT)
+    print(f"[Async Server] Starting TLS on port {PORT}...")
+    
+    # Load SSL Certificate
+    try:
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain('cert.pem', 'key.pem')
+        print("[Async Server] SSL certificate loaded successfully.")
+    except FileNotFoundError:
+        print("[Async Server] ERROR: cert.pem or key.pem not found!")
+        print("Generate them using: py generate_cert.py")
+        return
+
+    # Start the encrypted server
+    server = await asyncio.start_server(handle_client, HOST, PORT, ssl=ssl_context)
     async with server:
-        print(f"[Async Server] Waiting for clients...")
+        print(f"[Async Server] Waiting for encrypted clients...")
         await server.serve_forever()
 
 if __name__ == "__main__":
