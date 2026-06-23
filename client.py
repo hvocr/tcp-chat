@@ -1,14 +1,21 @@
 import socket
 import threading
 import time
-import msvcrt
 import sys
+import ssl
+import queue
 
 HOST = '127.0.0.1'
 PORT = 65432
 
+def create_ssl_socket():
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context.wrap_socket(raw_sock, server_hostname=HOST)
+
 def recv_exact(client_socket, size):
-    """Receive exactly `size` bytes from the socket."""
     data = b''
     while len(data) < size:
         try:
@@ -16,178 +23,134 @@ def recv_exact(client_socket, size):
             if not chunk:
                 return None
             data += chunk
-        except:
+        except (ConnectionError, socket.timeout):
             return None
     return data
 
 def send_message(client_socket, message):
-    """Send a length-prefixed message."""
     try:
         msg_bytes = message.encode('utf-8')
         header = len(msg_bytes).to_bytes(4, 'big')
         client_socket.sendall(header + msg_bytes)
         return True
-    except:
+    except (ConnectionError, BrokenPipeError, socket.error):
         return False
 
-def receive_messages(client_socket, message_queue, connected_flag):
+def receive_messages(client_socket, msg_queue, stop_flag):
     """Background thread: listens for messages and puts them in a queue."""
-    while connected_flag[0]:
+    while not stop_flag.is_set():
         try:
             header = recv_exact(client_socket, 4)
             if header is None:
-                message_queue.append("[Server] Disconnected.")
-                connected_flag[0] = False
+                msg_queue.put("[Server] Disconnected.")
+                stop_flag.set()
                 break
+            
             msg_len = int.from_bytes(header, 'big')
             msg_bytes = recv_exact(client_socket, msg_len)
             if msg_bytes is None:
-                message_queue.append("[Server] Disconnected.")
-                connected_flag[0] = False
+                msg_queue.put("[Server] Disconnected.")
+                stop_flag.set()
                 break
             
             message = msg_bytes.decode('utf-8')
-            message_queue.append(message)
+            msg_queue.put(message)
             
+        except (UnicodeDecodeError, ValueError):
+            continue
         except Exception as e:
-            message_queue.append("[Server] Disconnected.")
-            connected_flag[0] = False
+            msg_queue.put(f"[Client] Error: {type(e).__name__}: {e}")
+            stop_flag.set()
             break
 
-def connect_with_retry():
-    """Attempt to connect with exponential backoff."""
-    delay = 1
-    while True:
+def flush_messages(msg_queue):
+    """Print all pending messages from the queue."""
+    while not msg_queue.empty():
         try:
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(5.0)
-            client_socket.connect((HOST, PORT))
-            client_socket.settimeout(None)
-            return client_socket
-        except:
+            msg = msg_queue.get_nowait()
+            print(f"\n{msg}")
+        except queue.Empty:
+            break
+
+def connect_with_retry(stop_flag):
+    delay = 1
+    while not stop_flag.is_set():
+        try:
+            ssl_sock = create_ssl_socket()
+            ssl_sock.settimeout(5.0)
+            ssl_sock.connect((HOST, PORT))
+            ssl_sock.settimeout(None)
+            return ssl_sock
+        except (ConnectionError, socket.timeout, OSError):
             print(f"[Client] Connection failed. Retrying in {delay}s...")
             time.sleep(delay)
             delay = min(delay * 2, 60)
+        except KeyboardInterrupt:
+            stop_flag.set()
+            return None
+    return None
 
 def start_client():
-    # 1. Get nickname
     nickname = input("Enter your nickname: ").strip()
     if not nickname:
         nickname = "Anonymous"
     
-    # 2. Connect
-    print("[Client] Connecting to server...")
-    client_socket = connect_with_retry()
-    print("[Client] Connected!")
+    stop_flag = threading.Event()
+    msg_queue = queue.Queue()
     
-    # 3. Send nickname
-    if not send_message(client_socket, nickname):
-        print("[Client] Failed to send nickname. Exiting.")
+    print("[Client] Connecting to server (TLS)...")
+    client_socket = connect_with_retry(stop_flag)
+    if client_socket is None:
         return
     
-    print(f"[Client] Connected as '{nickname}'!")
-    print("Commands: /users, /msg <nickname> <message>, /quit")
-    print("Type your messages below. Press Enter to send.\n")
+    if not send_message(client_socket, nickname):
+        print("[Client] Failed to send nickname. Server might be down.")
+        return
     
-    # 4. Message queue and connection flag
-    message_queue = []
-    connected_flag = [True]
-    
-    # 5. Start background listener
-    receive_thread = threading.Thread(
+    # Start the background receiver thread
+    receiver = threading.Thread(
         target=receive_messages, 
-        args=(client_socket, message_queue, connected_flag), 
+        args=(client_socket, msg_queue, stop_flag),
         daemon=True
     )
-    receive_thread.start()
+    receiver.start()
     
-    # 6. Non-blocking input loop
-    input_buffer = ""
-    prompt = "You: "
-    print(prompt, end="", flush=True)
+    print(f"[Client] Connected as '{nickname}'!")
+    print("Commands: /users, /msg <user> <msg>, /quit, /join, /rooms")
+    print("Type your messages below.\n")
     
-    while True:
-        # --- CHECK FOR DISCONNECTION ---
-        if not connected_flag[0]:
-            print("\n[Client] Lost connection. Reconnecting...")
-            client_socket.close()
-            client_socket = connect_with_retry()
-            print("[Client] Reconnected!")
-            send_message(client_socket, nickname)
-            connected_flag[0] = True
-            message_queue.clear()  # <--- FIX: Clear stale messages
-            
-            # Restart receiver thread
-            receive_thread = threading.Thread(
-                target=receive_messages, 
-                args=(client_socket, message_queue, connected_flag), 
-                daemon=True
-            )
-            receive_thread.start()
-            # Re-print prompt
-            print(prompt, end="", flush=True)
-            continue
+    # Main thread handles sending + message display
+    while not stop_flag.is_set():
+        # Step 1: Print any pending messages BEFORE showing the prompt
+        flush_messages(msg_queue)
         
-        # --- CHECK FOR INCOMING MESSAGES ---
-        while message_queue:
-            msg = message_queue.pop(0)
-            # Clear the current line, print message, re-print prompt
-            sys.stdout.write("\r" + " " * 80 + "\r")
-            print(msg)
-            sys.stdout.write(prompt + input_buffer)
-            sys.stdout.flush()
-        
-        # --- CHECK FOR KEYBOARD INPUT ---
-        if msvcrt.kbhit():
-            char = msvcrt.getch()
-            
-            if char == b'\r':  # Enter key
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                if input_buffer.lower() == '/quit':
-                    break
-                if input_buffer.strip():
-                    if not send_message(client_socket, input_buffer):
-                        print("\n[Client] Failed to send. Reconnecting...")
-                        client_socket.close()
-                        client_socket = connect_with_retry()
-                        send_message(client_socket, nickname)
-                        connected_flag[0] = True
-                        message_queue.clear()  # <--- FIX: Clear stale messages here too
-                        receive_thread = threading.Thread(
-                            target=receive_messages, 
-                            args=(client_socket, message_queue, connected_flag), 
-                            daemon=True
-                        )
-                        receive_thread.start()
-                        print("[Client] Reconnected!")
-                input_buffer = ""
-                sys.stdout.write(prompt + input_buffer)
-                sys.stdout.flush()
-                
-            elif char == b'\x08':  # Backspace
-                if input_buffer:
-                    input_buffer = input_buffer[:-1]
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
-                    
-            elif char == b'\x03':  # Ctrl+C
+        # Step 2: Show the prompt and wait for input
+        try:
+            message = input("You: ")
+            if message.lower() == '/quit':
                 break
-                
-            else:
-                # Regular character
-                try:
-                    char_str = char.decode('utf-8')
-                    if char_str.isprintable():
-                        input_buffer += char_str
-                        sys.stdout.write(char_str)
-                        sys.stdout.flush()
-                except:
-                    pass
-        
-        # Small sleep to prevent CPU spinning
-        time.sleep(0.01)
+            
+            if message.strip():
+                if not send_message(client_socket, message):
+                    print("[Client] Failed to send. Reconnecting...")
+                    client_socket.close()
+                    client_socket = connect_with_retry(stop_flag)
+                    if not client_socket:
+                        break
+                    send_message(client_socket, nickname)
+                    print("[Client] Reconnected securely!")
+        except KeyboardInterrupt:
+            break
+        except (ConnectionError, BrokenPipeError):
+            print("\n[Client] Connection lost. Reconnecting...")
+            client_socket.close()
+            client_socket = connect_with_retry(stop_flag)
+            if not client_socket:
+                break
+            send_message(client_socket, nickname)
+            print("[Client] Reconnected securely!")
     
+    stop_flag.set()
     client_socket.close()
     print("\n[Client] Disconnected.")
 
